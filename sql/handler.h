@@ -43,6 +43,7 @@
 #include <keycache.h>
 #include <mysql/psi/mysql_table.h>
 #include "sql_sequence.h"
+#include <utility>     // pair
 
 class Alter_info;
 class Virtual_column_info;
@@ -872,6 +873,15 @@ typedef struct xid_t XID;
 #define SQL_XIDSIZE (XIDDATASIZE * 2 + 8 + MY_INT64_NUM_DECIMAL_DIGITS)
 /* The 'buf' has to have space for at least SQL_XIDSIZE bytes. */
 uint get_sql_xid(XID *xid, char *buf);
+
+/* struct for semisync slave binlog truncate recovery */
+struct xid_recovery_member
+{
+  my_xid xid;
+  uint in_engine_prepare;  // number of engines that have xid prepared
+  bool decided_to_commit;
+  std::pair<uint, my_off_t> binlog_coord; // semisync recovery binlog offset
+};
 
 /* for recover() handlerton call */
 #define MIN_XID_LIST_SIZE  128
@@ -4814,7 +4824,8 @@ int ha_commit_one_phase(THD *thd, bool all);
 int ha_commit_trans(THD *thd, bool all);
 int ha_rollback_trans(THD *thd, bool all);
 int ha_prepare(THD *thd);
-int ha_recover(HASH *commit_list);
+int ha_recover(HASH *commit_list, MEM_ROOT *mem_root= NULL);
+uint ha_recover_complete(HASH *commit_list, std::pair<uint, my_off_t> *coord);
 
 /* transactions: these functions never call handlerton functions directly */
 int ha_enable_transaction(THD *thd, bool on);
@@ -4886,4 +4897,8 @@ int del_global_table_stat(THD *thd, const  LEX_CSTRING *db, const LEX_CSTRING *t
 @note This does not need to be multi-byte safe or anything */
 char *xid_to_str(char *buf, const XID &xid);
 #endif // !DBUG_OFF
+uint ha_count_rw_2pc(THD *thd, bool all);
+uint ha_check_and_coalesce_trx_read_only(THD *thd, Ha_trx_info *ha_list,
+                                         bool all);
+
 #endif /* HANDLER_INCLUDED */

@@ -1245,6 +1245,24 @@ int ha_prepare(THD *thd)
   DBUG_RETURN(error);
 }
 
+/*
+  Returns counted number of
+  read-write recoverable transaction participants.
+*/
+uint ha_count_rw_2pc(THD *thd, bool all)
+{
+  unsigned rw_ha_count= 0;
+  THD_TRANS *trans=all ? &thd->transaction.all : &thd->transaction.stmt;
+
+  for (Ha_trx_info * ha_info= trans->ha_list; ha_info;
+       ha_info= ha_info->next())
+  {
+    if (ha_info->is_trx_read_write() && ha_info->ht()->recover)
+      ++rw_ha_count;
+  }
+  return rw_ha_count;
+}
+
 /**
   Check if we can skip the two-phase commit.
 
@@ -1264,7 +1282,6 @@ int ha_prepare(THD *thd)
                 engines with read-write changes.
 */
 
-static
 uint
 ha_check_and_coalesce_trx_read_only(THD *thd, Ha_trx_info *ha_list,
                                     bool all)
@@ -1623,6 +1640,24 @@ int ha_commit_one_phase(THD *thd, bool all)
   DBUG_RETURN(res);
 }
 
+static bool is_ro_1pc_trans(THD *thd, Ha_trx_info *ha_info, bool all,
+                            bool is_real_trans)
+{
+  uint rw_ha_count= ha_check_and_coalesce_trx_read_only(thd, ha_info, all);
+  bool rw_trans= is_real_trans &&
+    (rw_ha_count > (thd->is_current_stmt_binlog_disabled()?0U:1U));
+
+  return !rw_trans;
+}
+
+static bool has_binlog_hton(Ha_trx_info *ha_info)
+{
+  bool rc;
+  for (rc= false; ha_info && !rc; ha_info= ha_info->next())
+    rc= ha_info->ht() == binlog_hton;
+
+  return rc;
+}
 
 static int
 commit_one_phase_2(THD *thd, bool all, THD_TRANS *trans, bool is_real_trans)
@@ -1635,9 +1670,17 @@ commit_one_phase_2(THD *thd, bool all, THD_TRANS *trans, bool is_real_trans)
     DEBUG_SYNC(thd, "commit_one_phase_2");
   if (ha_info)
   {
+    int err;
+
+    if (has_binlog_hton(ha_info) &&
+        (err= binlog_commit(thd, all,
+                            is_ro_1pc_trans(thd, ha_info, all, is_real_trans))))
+    {
+      my_error(ER_ERROR_DURING_COMMIT, MYF(0), err);
+      error= 1;
+    }
     for (; ha_info; ha_info= ha_info_next)
     {
-      int err;
       handlerton *ht= ha_info->ht();
       if ((err= ht->commit(ht, thd, all)))
       {
@@ -1942,7 +1985,7 @@ static my_xid wsrep_order_and_check_continuity(XID *list, int len)
   recover() step of xa.
 
   @note
-    there are three modes of operation:
+    there are four modes of operation:
     - automatic recover after a crash
     in this case commit_list != 0, tc_heuristic_recover==0
     all xids from commit_list are committed, others are rolled back
@@ -1953,6 +1996,9 @@ static my_xid wsrep_order_and_check_continuity(XID *list, int len)
     - no recovery (MySQL did not detect a crash)
     in this case commit_list==0, tc_heuristic_recover == 0
     there should be no prepared transactions in this case.
+    - automatic recovery for the semisync slave server: uncommitted
+    transactions are rolled back and when they are in binlog it gets
+    truncated to the first uncommitted transaction start offset.
 */
 struct xarecover_st
 {
@@ -1960,7 +2006,176 @@ struct xarecover_st
   XID *list;
   HASH *commit_list;
   bool dry_run;
+  MEM_ROOT *mem_root;
+  bool error;
 };
+
+/**
+  Inserts a new hash member.
+
+  returns a successfully created and inserted @c xid_recovery_member
+           into hash @c hash_arg,
+           or NULL.
+*/
+static xid_recovery_member*
+xid_member_insert(HASH *hash_arg, my_xid xid_arg, MEM_ROOT *ptr_mem_root)
+{
+  xid_recovery_member *member= (xid_recovery_member*)
+    alloc_root(ptr_mem_root, sizeof(xid_recovery_member));
+  if (!member)
+    return NULL;
+
+  member->xid= xid_arg;
+  member->in_engine_prepare= 1;
+  member->decided_to_commit= false;
+
+  return my_hash_insert(hash_arg, (uchar*) member) ? NULL : member;
+}
+
+/*
+  Inserts a new or updates an existing hash member to increment
+  the member's prepare counter.
+
+  returns false  on success,
+           true   otherwise.
+*/
+static bool xid_member_replace(HASH *hash_arg, my_xid xid_arg,
+                               MEM_ROOT *ptr_mem_root)
+{
+  xid_recovery_member* member;
+  if ((member= (xid_recovery_member *)
+       my_hash_search(hash_arg, (uchar *)& xid_arg, sizeof(xid_arg))))
+    member->in_engine_prepare++;
+  else
+    member= xid_member_insert(hash_arg, xid_arg, ptr_mem_root);
+
+  return member == NULL;
+}
+
+/*
+  Decision to commit returns true, otherwise false for rollback.
+  Flagged to commit member is destined to commit. If it is in doubt in case
+  A. the caller does not specify coord_ptr (always so in the normal recovery), or
+  B. coord_ptr is not NULL (can only be so in the semisync slave case) and its
+     offset is greater than that of the member's the decision is rollback.
+  If both A,B do not hold - which is the semisync slave recovery case -
+  the decision is to rollback.
+*/
+static bool xarecover_decide(xid_recovery_member* member,
+                             xid_t x, std::pair<uint, my_off_t> *coord_ptr)
+{
+  return
+    member->decided_to_commit ? true :
+    !coord_ptr ? false :
+    (member->binlog_coord < *coord_ptr ?  // semisync slave recovery
+     true : false);
+}
+
+struct xarecover_iterate_arg
+{
+  handlerton *hton;
+  std::pair<uint, my_off_t> *binlog_coord;
+};
+
+/*
+  Hash iterate function to complete with commit or rollback as either
+  has been decided already or decide now (in the semisync recovery)
+  via comparison against passed offset.
+  Commit when the offset is greater than that of the member.
+*/
+static my_bool xarecover_do_commit_or_rollback(void *member_arg,
+                                               void *iter_arg)
+{
+  xid_recovery_member *member= (xid_recovery_member*) member_arg;
+  handlerton *hton= ((xarecover_iterate_arg*) iter_arg)->hton;
+  std::pair<uint, my_off_t> *max_coord_ptr=
+    ((xarecover_iterate_arg*) iter_arg)->binlog_coord;
+  xid_t x;
+  my_bool rc;
+
+  x.set(member->xid);
+
+  rc= xarecover_decide(member, x, max_coord_ptr) ?
+    hton->commit_by_xid(hton, &x) : hton->rollback_by_xid(hton, &x);
+
+  DBUG_ASSERT(rc || member->in_engine_prepare > 0);
+
+  if (!rc)
+  {
+    /*
+      This block relies on Engine to report XAER_NOTA at
+      "complete"_by_xid for unknown xid.
+    */
+    member->in_engine_prepare--;
+    if (global_system_variables.log_warnings > 2)
+      sql_print_warning("%s transaction with xid %llu",
+                        member->decided_to_commit ?
+                        "Committed" : "Rolled back", (ulonglong) member->xid);
+  }
+
+  return false;
+}
+
+static my_bool xarecover_do_count_in_prepare(void *member_arg,
+                                             void *ptr_count)
+{
+  xid_recovery_member *member= (xid_recovery_member*) member_arg;
+  if (member->in_engine_prepare)
+  {
+    (*(uint*) ptr_count)++;
+    if (global_system_variables.log_warnings > 2)
+      sql_print_warning("Found prepared transaction with xid %llu",
+                        (ulonglong) member->xid);
+  }
+
+  return false;
+}
+
+struct xarecover_complete_arg
+{
+  HASH *commit_list;
+  std::pair<uint, my_off_t> *binlog_coord;
+};
+
+/*
+  Completes binlog recovery to invoke a decider function for
+  each transaction in doubt.
+*/
+static my_bool xarecover_binlog_handlerton(THD *unused,
+                                           plugin_ref plugin,
+                                           void *arg)
+{
+    handlerton *hton= plugin_hton(plugin);
+
+    if (hton->state == SHOW_OPTION_YES && hton->recover)
+    {
+      xarecover_iterate_arg iter_arg=
+        {
+          hton,
+          ((xarecover_complete_arg*) arg)->binlog_coord
+        };
+      my_hash_iterate(((xarecover_complete_arg*) arg)->commit_list,
+                      xarecover_do_commit_or_rollback, &iter_arg);
+    }
+
+    return FALSE;
+}
+
+/*
+  Completes binlog recovery to invoke decider functions for
+  each handerton.
+  Returns the number of transactions remained doubtful.
+*/
+uint ha_recover_complete(HASH *commit_list, std::pair<uint, my_off_t> *coord)
+{
+  uint count= 0;
+  xarecover_complete_arg complete_arg= { commit_list, coord };
+  plugin_foreach(NULL, xarecover_binlog_handlerton,
+                 MYSQL_STORAGE_ENGINE_PLUGIN, &complete_arg);
+  my_hash_iterate(commit_list, xarecover_do_count_in_prepare, &count);
+
+  return count;
+}
 
 static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
                                     void *arg)
@@ -1971,6 +2186,9 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
 
   if (hton->state == SHOW_OPTION_YES && hton->recover)
   {
+#ifndef DBUG_OFF
+    my_xid dbug_xid_list[128] __attribute__((unused)) = {0};
+#endif
     while ((got= hton->recover(hton, info->list, info->len)) > 0 )
     {
       sql_print_information("Found %d prepared transaction(s) in %s",
@@ -2013,7 +2231,20 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
           info->found_my_xids++;
           continue;
         }
-        // recovery mode
+
+        /*
+          Regular and semisync slave server recovery only collects
+          xids to make decisions on them later by the caller.
+        */
+        if (info->mem_root)
+        {
+          if (xid_member_replace(info->commit_list, x, info->mem_root))
+          {
+            info->error= true;
+            sql_print_error("Error in memory allocation at xarecover_handlerton");
+            break;
+          }
+        } else
         if (IF_WSREP((wsrep_emulate_bin_log &&
                       wsrep_is_wsrep_xid(info->list + i) &&
                       x <= wsrep_limit), false) ||
@@ -2057,7 +2288,7 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
   return FALSE;
 }
 
-int ha_recover(HASH *commit_list)
+int ha_recover(HASH *commit_list, MEM_ROOT *arg_mem_root)
 {
   struct xarecover_st info;
   DBUG_ENTER("ha_recover");
@@ -2065,6 +2296,8 @@ int ha_recover(HASH *commit_list)
   info.commit_list= commit_list;
   info.dry_run= (info.commit_list==0 && tc_heuristic_recover==0);
   info.list= NULL;
+  info.mem_root= arg_mem_root;
+  info.error= false;
 
   /* commit_list and tc_heuristic_recover cannot be set both */
   DBUG_ASSERT(info.commit_list==0 || tc_heuristic_recover==0);
@@ -2109,6 +2342,9 @@ int ha_recover(HASH *commit_list)
                     info.found_my_xids, opt_tc_log_file);
     DBUG_RETURN(1);
   }
+  if (info.error)
+    DBUG_RETURN(1);
+
   if (info.commit_list)
     sql_print_information("Crash recovery finished.");
   DBUG_RETURN(0);
