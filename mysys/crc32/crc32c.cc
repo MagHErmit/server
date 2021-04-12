@@ -21,9 +21,10 @@
 #include <string>
 #include <my_global.h>
 #include <my_byteorder.h>
-static inline uint32_t DecodeFixed32(const char *ptr)
+
+static inline uint32_t LE_LOAD32(const uint8_t *ptr)
 {
-  return uint4korr(ptr);
+  return uint4korr(reinterpret_cast<const char*>(ptr));
 }
 
 #include <stdint.h>
@@ -32,11 +33,25 @@ static inline uint32_t DecodeFixed32(const char *ptr)
 #endif
 
 #ifdef HAVE_SSE42
-#include <nmmintrin.h>
-#include <wmmintrin.h>
-#ifdef __GNUC__
-#include <cpuid.h>
-#endif
+# ifdef __GNUC__
+#  include <cpuid.h>
+#  if __GNUC__ < 5 && !defined __clang__
+/* the headers do not really work in GCC before version 5 */
+#   define _mm_crc32_u8(crc,data) __builtin_ia32_crc32qi(crc,data)
+#   define _mm_crc32_u32(crc,data) __builtin_ia32_crc32si(crc,data)
+#   define _mm_crc32_u64(crc,data) __builtin_ia32_crc32di(crc,data)
+#  else
+#   include <nmmintrin.h>
+#   ifdef HAVE_PCLMUL
+#    include <wmmintrin.h>
+#   endif
+#  endif
+#  define USE_SSE42 __attribute__((target("sse4.2,pclmul")))
+#  define USE_PCLMUL __attribute__((target("sse4.2,pclmul")))
+# else
+#  define USE_SSE42 /* nothing */
+#  define USE_PCLMUL /* nothing */
+# endif
 #endif
 
 
@@ -332,24 +347,8 @@ static const uint32_t table3_[256] = {
   0x4a21617b, 0x9764cbc3, 0xf54642fa, 0x2803e842
 };
 
-// Used to fetch a naturally-aligned 32-bit word in little endian byte-order
-static inline uint32_t LE_LOAD32(const uint8_t *p) {
-  return DecodeFixed32(reinterpret_cast<const char*>(p));
-}
-
-#if defined(HAVE_SSE42) && (SIZEOF_SIZE_T == 8)
-
-static inline uint64_t DecodeFixed64(const char *ptr)
+static inline void Slow_CRC32(uint64_t* l, uint8_t const **p)
 {
-  return uint8korr(ptr);
-}
-
-static inline uint64_t LE_LOAD64(const uint8_t *p) {
-  return DecodeFixed64(reinterpret_cast<const char*>(p));
-}
-#endif
-
-static inline void Slow_CRC32(uint64_t* l, uint8_t const **p) {
   uint32_t c = static_cast<uint32_t>(*l ^ LE_LOAD32(*p));
   *p += 4;
   *l = table3_[c & 0xff] ^
@@ -365,27 +364,6 @@ static inline void Slow_CRC32(uint64_t* l, uint8_t const **p) {
   table0_[c >> 24];
 }
 
-__attribute__((unused)) static inline void Fast_CRC32(uint64_t* l, uint8_t const **p) {
-#ifndef HAVE_SSE42
-  Slow_CRC32(l, p);
-#elif (SIZEOF_SIZE_T == 8)
-  *l = _mm_crc32_u64(*l, LE_LOAD64(*p));
-  *p += 8;
-#else
-  *l = _mm_crc32_u32(static_cast<unsigned int>(*l), LE_LOAD32(*p));
-  *p += 4;
-  *l = _mm_crc32_u32(static_cast<unsigned int>(*l), LE_LOAD32(*p));
-  *p += 4;
-#endif
-}
-
-template<void (*CRC32)(uint64_t*, uint8_t const**)>
-uint32_t ExtendImpl(uint32_t crc, const char* buf, size_t size) {
-
-  const uint8_t *p = reinterpret_cast<const uint8_t *>(buf);
-  const uint8_t *e = p + size;
-  uint64_t l = crc ^ 0xffffffffu;
-
 #ifdef ALIGN
 #undef ALIGN
 #endif
@@ -398,70 +376,111 @@ uint32_t ExtendImpl(uint32_t crc, const char* buf, size_t size) {
     l = table0_[c] ^ (l >> 8);                  \
 } while (0)
 
+static uint32_t crc32c_slow(uint32_t crc, const char* buf, size_t size)
+{
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(buf);
+  const uint8_t *e = p + size;
+  uint64_t l = crc ^ 0xffffffffu;
 
   // Point x at first 16-byte aligned byte in string.  This might be
   // just past the end of the string.
   const uintptr_t pval = reinterpret_cast<uintptr_t>(p);
   const uint8_t* x = reinterpret_cast<const uint8_t*>(ALIGN(pval, 4));
-  if (x <= e) {
+  if (x <= e)
     // Process bytes until finished or p is 16-byte aligned
-    while (p != x) {
+    while (p != x)
       STEP1;
-    }
-  }
   // Process bytes 16 at a time
-  while ((e-p) >= 16) {
-    CRC32(&l, &p);
-    CRC32(&l, &p);
+  while ((e-p) >= 16)
+  {
+    Slow_CRC32(&l, &p);
+    Slow_CRC32(&l, &p);
   }
   // Process bytes 8 at a time
-  while ((e-p) >= 8) {
-    CRC32(&l, &p);
-  }
+  while ((e-p) >= 8)
+    Slow_CRC32(&l, &p);
   // Process the last few bytes
-  while (p != e) {
+  while (p != e)
     STEP1;
-  }
-#undef STEP1
-#undef ALIGN
   return static_cast<uint32_t>(l ^ 0xffffffffu);
 }
 
-// Detect if ARM64 CRC or not.
-#ifndef HAVE_ARMV8_CRC
-// Detect if SS42 or not.
-#ifndef HAVE_POWER8
-
-static bool isSSE42() {
-#ifndef HAVE_SSE42
-  return false;
-#elif defined(__GNUC__)
+#if defined HAVE_POWER8
+#elif defined HAVE_ARMV8_CRC
+#elif !defined HAVE_SSE42
+static bool isSSE42() { return false; }
+static bool isPCLMULQDQ() { return false; }
+#else
+static bool isSSE42()
+{
+# if defined(__GNUC__)
   uint32_t reax= 0, rebx= 0, recx= 0, redx= 0;
   __cpuid(1, reax, rebx, recx, redx);
   return (recx & ((int)1 << 20)) != 0;
-#elif defined(_MSC_VER)
+# elif defined(_MSC_VER)
   int info[4];
   __cpuid(info, 0x00000001);
   return (info[2] & ((int)1 << 20)) != 0;
-#else
+# else
   return false;
-#endif
+# endif
 }
 
-#ifdef HAVE_SSE42
+#if SIZEOF_SIZE_T == 8
+USE_SSE42 static inline uint64_t LE_LOAD64(const uint8_t *ptr)
+{
+  return uint8korr(reinterpret_cast<const char*>(ptr));
+}
+#endif
+
+USE_SSE42
+static inline void Fast_CRC32(uint64_t* l, uint8_t const **p)
+{
+# if (SIZEOF_SIZE_T == 8)
+  *l = _mm_crc32_u64(*l, LE_LOAD64(*p));
+  *p += 8;
+# else
+  *l = _mm_crc32_u32(static_cast<unsigned int>(*l), LE_LOAD32(*p));
+  *p += 4;
+  *l = _mm_crc32_u32(static_cast<unsigned int>(*l), LE_LOAD32(*p));
+  *p += 4;
+# endif
+}
+
+USE_SSE42
+static uint32_t crc32c_sse42(uint32_t crc, const char* buf, size_t size)
+{
+  const uint8_t *p = reinterpret_cast<const uint8_t *>(buf);
+  const uint8_t *e = p + size;
+  uint64_t l = crc ^ 0xffffffffu;
+
+  // Point x at first 16-byte aligned byte in string.  This might be
+  // just past the end of the string.
+  const uintptr_t pval = reinterpret_cast<uintptr_t>(p);
+  const uint8_t* x = reinterpret_cast<const uint8_t*>(ALIGN(pval, 4));
+  if (x <= e)
+    // Process bytes until finished or p is 16-byte aligned
+    while (p != x)
+      STEP1;
+  // Process bytes 16 at a time
+  while ((e-p) >= 16)
+  {
+    Fast_CRC32(&l, &p);
+    Fast_CRC32(&l, &p);
+  }
+  // Process bytes 8 at a time
+  while ((e-p) >= 8)
+    Fast_CRC32(&l, &p);
+  // Process the last few bytes
+  while (p != e)
+    STEP1;
+  return static_cast<uint32_t>(l ^ 0xffffffffu);
+}
+
 extern "C" int crc32_pclmul_enabled();
-#endif
 
-static bool isPCLMULQDQ() {
-#ifdef HAVE_SSE42
-  return crc32_pclmul_enabled();
-#else
-  return false;
+static bool isPCLMULQDQ() { return crc32_pclmul_enabled(); }
 #endif
-}
-
-#endif  // HAVE_POWER8
-#endif  // HAVE_ARMV8_CRC
 
 typedef uint32_t (*Function)(uint32_t, const char*, size_t);
 
@@ -538,7 +557,7 @@ extern "C" const char * my_crc32c_implementation()
 #elif HAVE_SSE42
   if (isSSE42())
   {
-    if (SIZEOF_SIZE_T == 8 && isPCLMULQDQ())
+    if (isPCLMULQDQ())
       return "Using crc32 + pclmulqdq instructions";
     return "Using SSE4.2 crc32 instructions";
   }
@@ -662,7 +681,7 @@ static const uint64_t clmul_constants[] = {
 };
 
 // Compute the crc32c value for buffer smaller than 8
-static inline void align_to_8(
+USE_PCLMUL static inline void align_to_8(
     size_t len,
     uint64_t& crc0, // crc so far, updated on return
     const unsigned char*& next) { // next data pointer, updated on return
@@ -686,7 +705,7 @@ static inline void align_to_8(
 // CombineCRC performs pclmulqdq multiplication of 2 partial CRC's and a well
 // chosen constant and xor's these with the remaining CRC.
 //
-static inline uint64_t CombineCRC(
+USE_PCLMUL static inline uint64_t CombineCRC(
     size_t block_size,
     uint64_t crc0,
     uint64_t crc1,
@@ -706,6 +725,7 @@ static inline uint64_t CombineCRC(
 }
 
 // Compute CRC-32C using the Intel hardware instruction.
+USE_PCLMUL
 static inline uint32_t crc32c_3way(uint32_t crc, const char* buf, size_t len) {
   const unsigned char* next = (const unsigned char*)buf;
   uint64_t count;
@@ -1245,30 +1265,21 @@ static inline uint32_t crc32c_3way(uint32_t crc, const char* buf, size_t len) {
 
 static inline Function Choose_Extend() {
 #ifdef HAVE_POWER8
-  return isAltiVec() ? ExtendPPCImpl : ExtendImpl<Slow_CRC32>;
+  if (isAltiVec()) return ExtendPPCImpl;
 #elif defined(HAVE_ARMV8_CRC)
-  if(crc32c_aarch64_available()) {
+  if (crc32c_aarch64_available())
     return ExtendARMImpl;
-  } else {
-    return ExtendImpl<Slow_CRC32>;
-  }
 #else
-  if (isSSE42()) {
-    if (isPCLMULQDQ()) {
-#if defined HAVE_SSE42  && defined HAVE_PCLMUL && !defined NO_THREEWAY_CRC32C
+  if (isSSE42())
+  {
+# if defined HAVE_SSE42 && defined HAVE_PCLMUL && !defined NO_THREEWAY_CRC32C
+    if (isPCLMULQDQ())
       return crc32c_3way;
-#else
-    return ExtendImpl<Fast_CRC32>; // Fast_CRC32 will check HAVE_SSE42 itself
-#endif
-    }
-    else {  // no runtime PCLMULQDQ support but has SSE42 support
-      return ExtendImpl<Fast_CRC32>;
-    }
-  } // end of isSSE42()
-  else {
-    return ExtendImpl<Slow_CRC32>;
+# endif
+    return crc32c_sse42;
   }
 #endif
+  return crc32c_slow;
 }
 
 static const Function ChosenExtend = Choose_Extend();
@@ -1279,7 +1290,7 @@ static inline uint32_t Extend(uint32_t crc, const char* buf, size_t size) {
 }  // namespace crc32c
 }  // namespace mysys_namespace
 
-extern "C" unsigned int my_crc32c(unsigned int crc, const char *buf, size_t size)
+extern "C" unsigned my_crc32c(unsigned int crc, const char *buf, size_t size)
 {
   return mysys_namespace::crc32c::Extend(crc,buf, size);
 }
