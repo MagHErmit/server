@@ -68,6 +68,9 @@ static int _my_b_cache_read_r(IO_CACHE *info, uchar *Buffer, size_t Count);
 static int _my_b_seq_read(IO_CACHE *info, uchar *Buffer, size_t Count);
 static int _my_b_cache_write(IO_CACHE *info, const uchar *Buffer, size_t Count);
 static int _my_b_cache_write_r(IO_CACHE *info, const uchar *Buffer, size_t Count);
+/* MDEV-24676 */
+static int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count);
+static int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count);
 
 int (*_my_b_encr_read)(IO_CACHE *info,uchar *Buffer,size_t Count)= 0;
 int (*_my_b_encr_write)(IO_CACHE *info,const uchar *Buffer,size_t Count)= 0;
@@ -114,6 +117,10 @@ init_functions(IO_CACHE* info)
     DBUG_ASSERT(!(info->myflags & MY_ENCRYPT));
     info->read_function = info->share ? _my_b_cache_read_r : _my_b_cache_read;
     info->write_function = info->share ? _my_b_cache_write_r : _my_b_cache_write;
+    break;
+  case CBQ_READ_APPEND:
+    info->read_function = _my_b_cache_read_concurrent;
+    info->write_function = _my_b_cache_write_concurrent;
     break;
   case TYPE_NOT_SET:
     DBUG_ASSERT(0);
@@ -537,11 +544,11 @@ int _my_b_read(IO_CACHE *info, uchar *Buffer, size_t Count)
 
 int _my_b_write(IO_CACHE *info, const uchar *Buffer, size_t Count)
 {
-  if(info->type == CBQ_READ_APPEND)
-    return info->write_function(info, Buffer, Count);
+
   size_t rest_length;
   int res;
-
+  if(info->type == CBQ_READ_APPEND)
+    return info->write_function(info, Buffer, Count);
   /* Always use my_b_flush_io_cache() to flush write_buffer! */
   DBUG_ASSERT(Buffer != info->write_buffer);
 
@@ -775,6 +782,14 @@ int _my_b_cache_read(IO_CACHE *info, uchar *Buffer, size_t Count)
     memcpy(Buffer, info->buffer, Count);
   DBUG_RETURN(0);
 }
+int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count)
+{
+  return -1;
+}
+int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count) {
+  return -1;
+}
+
 
 
 /*
