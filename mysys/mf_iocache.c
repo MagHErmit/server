@@ -522,7 +522,7 @@ int _my_b_read(IO_CACHE *info, uchar *Buffer, size_t Count)
   int res;
 
   /* If the buffer is not empty yet, copy what is available. */
-  if ((left_length= (size_t) (info->read_end - info->read_pos)))
+  if ((left_length= (size_t) (info->read_end - info->read_pos)) && info->type != CBQ_READ_APPEND)
   {
     DBUG_ASSERT(Count > left_length);
     memcpy(Buffer, info->read_pos, left_length);
@@ -537,6 +537,8 @@ int _my_b_read(IO_CACHE *info, uchar *Buffer, size_t Count)
 
 int _my_b_write(IO_CACHE *info, const uchar *Buffer, size_t Count)
 {
+  if(info->type == CBQ_READ_APPEND)
+    return info->write_function(info, Buffer, Count);
   size_t rest_length;
   int res;
 
