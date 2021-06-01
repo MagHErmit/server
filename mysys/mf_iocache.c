@@ -823,10 +823,40 @@ int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count)
   return 0;
 }
 int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count)
-{/*
+{
+  /*
+  size_t rest_length,length;
   lock_append_buffer(info);
+  // TODO: append_buffer is full
+
+  if (_my_b_flush_io_cache(info))
+  {
+    unlock_append_buffer(info);
+    return 1;
+  }
+  if (Count >= IO_SIZE)
+  {
+    length= IO_ROUND_DN(Count);
+    if (mysql_file_write(info->file,Buffer, length, info->myflags | MY_NABP))
+    {
+      unlock_append_buffer(info);
+      return info->error= -1;
+    }
+    Count-=length;
+    Buffer+=length;
+    info->end_of_file+=length;
+  }
+
   unlock_append_buffer(info);
-*/
+
+  memcpy(info->write_pos,Buffer,(size_t) Count);
+
+  lock_append_buffer(info);
+  info->write_pos += Count;
+  unlock_append_buffer(info);
+
+  info->total_size += Count;
+  */
   return 0;
 }
 
