@@ -9,6 +9,8 @@ int main() {
 
   my_b_read(&cache, buff, 4);
   my_b_safe_write(&cache, buff, 1);
+
+
   end_io_cache(&cache);
   my_close(cache.file, MYF(MY_WME));
 }

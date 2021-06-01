@@ -272,7 +272,7 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
   info->read_length=info->buffer_length=cachesize;
   info->myflags=cache_myflags & ~(MY_NABP | MY_FNABP);
   info->request_pos= info->read_pos= info->write_pos = info->buffer;
-  if (type == SEQ_READ_APPEND)
+  if (type == SEQ_READ_APPEND || type == CBQ_READ_APPEND)
   {
     info->append_read_pos = info->write_pos = info->write_buffer;
     info->write_end = info->write_buffer + info->buffer_length;
@@ -782,12 +782,77 @@ int _my_b_cache_read(IO_CACHE *info, uchar *Buffer, size_t Count)
     memcpy(Buffer, info->buffer, Count);
   DBUG_RETURN(0);
 }
+int _my_b_flush_io_cache(IO_CACHE *info);
+
 int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count)
-{
-  return -1;
+{/*
+  size_t sz_read = 0;
+  uchar *read_buffer = info->buffer;
+  uchar *read_pos;
+  if(info->read_pos == read_buffer)
+    sz_read = 0;//(read_from_buffer)
+  Buffer += sz_read;
+  Count -= sz_read;
+
+  // info->total_size -= sz_read;
+
+  if(Count == 0)
+    return 0;
+  else
+    sz_read = 0; //copy from append buffer
+
+  lock_append_buffer(info);
+  read_pos = info->read_pos;
+  read_buffer = info->buffer;
+  //uchar *append_start_pos = info->append_start_pos;
+  //uchar *append_size = info->append_size;
+  //uchar *append_pos = info->append_pos;
+
+  unlock_append_buffer(info);
+
+  // read from append buffer;
+
+  lock_append_buffer(info);
+  //info->append_size -= Count;
+  //info->append_start_pos += Count;
+  //if(info->append_start_pos >= info->append_buf + info->cache_size)
+  //  info->append_start_pos -= info->cache_size;
+  unlock_append_buffer(info);
+
+  //info->total_size -= Count;*/
+  return 0;
 }
-int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count) {
-  return -1;
+int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count)
+{/*
+  lock_append_buffer(info);
+  unlock_append_buffer(info);
+*/
+  return 0;
+}
+
+int _my_b_flush_io_cache(IO_CACHE *info)
+{
+  size_t length;
+
+  if ((length=(size_t) (info->write_pos - info->write_buffer)))
+  {
+    if (mysql_file_write(info->file, info->write_buffer, length,
+                         info->myflags | MY_NABP))
+    {
+      info->error= -1;
+      return -1;
+    }
+    info->end_of_file+= info->write_pos - info->append_read_pos;
+    info->append_read_pos= info->write_buffer;
+    DBUG_ASSERT(info->end_of_file == mysql_file_tell(info->file, MYF(0)));
+
+    info->write_end= (info->write_buffer + info->buffer_length -
+                      ((info->pos_in_file + length) & (IO_SIZE - 1)));
+    info->write_pos= info->write_buffer;
+    ++info->disk_writes;
+
+  }
+  return 0;
 }
 
 
