@@ -9,14 +9,14 @@ uchar* buff_to;
 void* read_to_cache()
 {
   for (int i= 0; i < 5; ++i)
-    my_b_read(&cache, buff_to, 4);
+    my_b_read(&cache, buff_to + (i*4), 4);
   return NULL;
 }
 
 void* write_to_cache()
 {
   for (int i= 0; i < 5; ++i)
-    my_b_write(&cache, buff_from, 4);
+    my_b_write(&cache, buff_from + (i*4), 4);
   return NULL;
 }
 
