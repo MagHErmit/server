@@ -787,33 +787,13 @@ int _my_b_cache_read(IO_CACHE *info, uchar *Buffer, size_t Count)
 }
 int _my_b_flush_io_cache(IO_CACHE *info);
 
-int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count)
+int _internal_concurrent_read_append(IO_CACHE *info, uchar *Buffer, size_t Count)
 {
-  size_t left_length;
+  size_t len_in_buff, copy_len, transfer_len;
   uchar* save_append_read_pos;
-  if(info->read_pos == info->read_end)
-    return -1; // IO_EMPTY
-
-  if (info->read_pos + Count <= info->read_end)
-  {
-    memcpy(Buffer, info->read_pos, Count);
-    info->read_pos+= Count;
-    return 0;
-  }
-
-  if ((left_length= (size_t) (info->read_end - info->read_pos)))
-  {
-    DBUG_ASSERT(Count > left_length);
-    memcpy(Buffer, info->read_pos, left_length);
-    Buffer+=left_length;
-    Count-=left_length;
-  }
-
   lock_append_buffer(info);
 
-  size_t len_in_buff = (size_t) (info->write_pos - info->append_read_pos);
-  size_t copy_len;
-  size_t transfer_len;
+  len_in_buff = (size_t) (info->write_pos - info->append_read_pos);
   DBUG_ASSERT(info->append_read_pos <= info->write_pos);
   copy_len=MY_MIN(Count, len_in_buff);
   save_append_read_pos = info->append_read_pos;
@@ -837,19 +817,44 @@ int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count)
   info->append_read_pos=info->write_pos;
   //info->end_of_file+=len_in_buff;
   unlock_append_buffer(info);
+  return 0;
+}
+
+int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count)
+{
+  size_t left_length;
+  if(info->read_pos == info->read_end)
+    return _internal_concurrent_read_append(info, Buffer, Count);
+
+  if (info->read_pos + Count <= info->read_end)
+  {
+    memcpy(Buffer, info->read_pos, Count);
+    info->read_pos+= Count;
+    return 0;
+  }
+
+  if ((left_length= (size_t) (info->read_end - info->read_pos)))
+  {
+    DBUG_ASSERT(Count > left_length);
+    memcpy(Buffer, info->read_pos, left_length);
+    Buffer+=left_length;
+    Count-=left_length;
+  }
+  return _internal_concurrent_read_append(info, Buffer, Count);
 }
 int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count)
 {
   size_t /*rest_length,*/length;
-  uchar* tmp;
 
   lock_append_buffer(info);
-  if (_my_b_flush_io_cache(info))
+  if(info->write_pos + Count > info->write_end)
   {
+    if (_my_b_flush_io_cache(info))
+    {
       unlock_append_buffer(info);
       return 1;
+    }
   }
-
   if (Count >= IO_SIZE)
   {
     length= IO_ROUND_DN(Count);
