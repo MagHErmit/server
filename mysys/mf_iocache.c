@@ -209,7 +209,7 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
   if (!cachesize && !(cachesize= my_default_record_cache_size))
     DBUG_RETURN(1);				/* No cache requested */
   min_cache=use_async_io ? IO_SIZE*4 : IO_SIZE*2;
-  if (type == READ_CACHE || type == SEQ_READ_APPEND)
+  if (type == READ_CACHE || type == SEQ_READ_APPEND || type == CBQ_READ_APPEND)
   {						/* Assume file isn't growing */
     DBUG_ASSERT(!(cache_myflags & MY_ENCRYPT));
     if (!(cache_myflags & MY_DONT_CHECK_FILESIZE))
@@ -245,7 +245,7 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
       if (cachesize < min_cache)
 	cachesize = min_cache;
       buffer_block= cachesize;
-      if (type == SEQ_READ_APPEND)
+      if (type == SEQ_READ_APPEND || type == CBQ_READ_APPEND)
 	buffer_block *= 2;
       else if (cache_myflags & MY_ENCRYPT)
         buffer_block= 2*(buffer_block + MY_AES_BLOCK_SIZE) + sizeof(IO_CACHE_CRYPT);
@@ -254,7 +254,7 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
 
       if ((info->buffer= (uchar*) my_malloc(key_memory_IO_CACHE, buffer_block, flags)) != 0)
       {
-	if (type == SEQ_READ_APPEND)
+	if (type == SEQ_READ_APPEND || type == CBQ_READ_APPEND)
 	  info->write_buffer= info->buffer + cachesize;
         else
           info->write_buffer= info->buffer;
@@ -297,6 +297,9 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
   info->end_of_file= end_of_file;
   info->error=0;
   info->type= type;
+
+  info->total_size = 0;
+
   init_functions(info);
   DBUG_RETURN(0);
 }
@@ -785,55 +788,68 @@ int _my_b_cache_read(IO_CACHE *info, uchar *Buffer, size_t Count)
 int _my_b_flush_io_cache(IO_CACHE *info);
 
 int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count)
-{/*
-  size_t sz_read = 0;
-  uchar *read_buffer = info->buffer;
-  uchar *read_pos;
-  if(info->read_pos == read_buffer)
-    sz_read = 0;//(read_from_buffer)
-  Buffer += sz_read;
-  Count -= sz_read;
+{
+  size_t left_length;
+  uchar* save_append_read_pos;
+  if(info->read_pos == info->read_end)
+    return -1; // IO_EMPTY
 
-  // info->total_size -= sz_read;
-
-  if(Count == 0)
+  if (info->read_pos + Count <= info->read_end)
+  {
+    memcpy(Buffer, info->read_pos, Count);
+    info->read_pos+= Count;
     return 0;
-  else
-    sz_read = 0; //copy from append buffer
+  }
+
+  if ((left_length= (size_t) (info->read_end - info->read_pos)))
+  {
+    DBUG_ASSERT(Count > left_length);
+    memcpy(Buffer, info->read_pos, left_length);
+    Buffer+=left_length;
+    Count-=left_length;
+  }
 
   lock_append_buffer(info);
-  read_pos = info->read_pos;
-  read_buffer = info->buffer;
-  //uchar *append_start_pos = info->append_start_pos;
-  //uchar *append_size = info->append_size;
-  //uchar *append_pos = info->append_pos;
 
+  size_t len_in_buff = (size_t) (info->write_pos - info->append_read_pos);
+  size_t copy_len;
+  size_t transfer_len;
+  DBUG_ASSERT(info->append_read_pos <= info->write_pos);
+  copy_len=MY_MIN(Count, len_in_buff);
+  save_append_read_pos = info->append_read_pos;
+  info->append_read_pos += copy_len;
   unlock_append_buffer(info);
 
-  // read from append buffer;
 
+  memcpy(Buffer, save_append_read_pos, copy_len);
+  /*
+  Count -= copy_len;
+  if (Count)
+    info->error= (int) (save_count - Count);
+  */
+
+  /* Fill read buffer with data from write buffer */
+  memcpy(info->buffer, info->append_read_pos,
+         (size_t) (transfer_len=len_in_buff - copy_len));
   lock_append_buffer(info);
-  //info->append_size -= Count;
-  //info->append_start_pos += Count;
-  //if(info->append_start_pos >= info->append_buf + info->cache_size)
-  //  info->append_start_pos -= info->cache_size;
+  info->read_pos= info->buffer;
+  info->read_end= info->buffer+transfer_len;
+  info->append_read_pos=info->write_pos;
+  //info->end_of_file+=len_in_buff;
   unlock_append_buffer(info);
-
-  //info->total_size -= Count;*/
-  return 0;
 }
 int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count)
 {
-  /*
-  size_t rest_length,length;
-  lock_append_buffer(info);
-  // TODO: append_buffer is full
+  size_t /*rest_length,*/length;
+  uchar* tmp;
 
+  lock_append_buffer(info);
   if (_my_b_flush_io_cache(info))
   {
-    unlock_append_buffer(info);
-    return 1;
+      unlock_append_buffer(info);
+      return 1;
   }
+
   if (Count >= IO_SIZE)
   {
     length= IO_ROUND_DN(Count);
@@ -847,16 +863,17 @@ int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Cou
     info->end_of_file+=length;
   }
 
+
   unlock_append_buffer(info);
 
-  memcpy(info->write_pos,Buffer,(size_t) Count);
+  memcpy(info->write_pos, Buffer, (size_t) Count);
 
   lock_append_buffer(info);
   info->write_pos += Count;
   unlock_append_buffer(info);
 
-  info->total_size += Count;
-  */
+//  info->total_size += Count;
+
   return 0;
 }
 

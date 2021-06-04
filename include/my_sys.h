@@ -478,6 +478,8 @@ typedef struct st_io_cache		/* Used when caching files */
     somewhere else
   */
   size_t alloced_buffer;
+
+  size_t total_size;
 } IO_CACHE;
 
 typedef int (*qsort2_cmp)(const void *, const void *, const void *);
