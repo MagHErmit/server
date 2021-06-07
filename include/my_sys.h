@@ -280,7 +280,9 @@ enum cache_type
 {
   TYPE_NOT_SET= 0, READ_CACHE, WRITE_CACHE,
   SEQ_READ_APPEND		/* sequential read or append */,
-  READ_FIFO, READ_NET};
+  READ_FIFO, READ_NET,
+  CBQ_READ_APPEND               /* MDEV-24676 concurrent cache */
+};
 
 enum flush_type
 {
@@ -476,6 +478,8 @@ typedef struct st_io_cache		/* Used when caching files */
     somewhere else
   */
   size_t alloced_buffer;
+
+  size_t total_size;
 } IO_CACHE;
 
 typedef int (*qsort2_cmp)(const void *, const void *, const void *);
@@ -501,7 +505,7 @@ static inline int my_b_inited(IO_CACHE *info) { return MY_TEST(info->buffer); }
 
 static inline int my_b_read(IO_CACHE *info, uchar *Buffer, size_t Count)
 {
-  if (info->read_pos + Count <= info->read_end)
+  if (info->read_pos + Count <= info->read_end && info->type != CBQ_READ_APPEND)
   {
     memcpy(Buffer, info->read_pos, Count);
     info->read_pos+= Count;
@@ -513,7 +517,7 @@ static inline int my_b_read(IO_CACHE *info, uchar *Buffer, size_t Count)
 static inline int my_b_write(IO_CACHE *info, const uchar *Buffer, size_t Count)
 {
   MEM_CHECK_DEFINED(Buffer, Count);
-  if (info->write_pos + Count <= info->write_end)
+  if (info->write_pos + Count <= info->write_end && info->type != CBQ_READ_APPEND)
   {
     if (Count)
     {
