@@ -21,7 +21,7 @@ void* write_to_cache()
 }
 
 int main() {
-  pthread_t thr_read, thr_write;
+  pthread_t thr_read;//, thr_write;
 
   int fd;
   buff_from = (uchar*)"qwer gfds hgfd sdfg";
@@ -29,11 +29,11 @@ int main() {
   fd = my_open("input.txt",O_CREAT | O_RDWR,MYF(MY_WME));
   init_io_cache(&cache, fd, 2, CBQ_READ_APPEND, 0,0, MYF(MY_WME));
 
-  pthread_create(&thr_write, NULL, write_to_cache, NULL);
+  //pthread_create(&thr_write, NULL, write_to_cache, NULL);
   pthread_create(&thr_read, NULL, read_to_cache, NULL);
 
   pthread_join(thr_read, NULL);
-  pthread_join(thr_write, NULL);
+  //pthread_join(thr_write, NULL);
 
   end_io_cache(&cache);
   my_close(cache.file, MYF(MY_WME));
