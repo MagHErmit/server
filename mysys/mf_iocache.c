@@ -245,7 +245,7 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
       if (cachesize < min_cache)
 	cachesize = min_cache;
       buffer_block= cachesize;
-      if (type == SEQ_READ_APPEND || type == CBQ_READ_APPEND)
+      if (type == SEQ_READ_APPEND)
 	buffer_block *= 2;
       else if (cache_myflags & MY_ENCRYPT)
         buffer_block= 2*(buffer_block + MY_AES_BLOCK_SIZE) + sizeof(IO_CACHE_CRYPT);
@@ -254,7 +254,7 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
 
       if ((info->buffer= (uchar*) my_malloc(key_memory_IO_CACHE, buffer_block, flags)) != 0)
       {
-	if (type == SEQ_READ_APPEND || type == CBQ_READ_APPEND)
+	if (type == SEQ_READ_APPEND)
 	  info->write_buffer= info->buffer + cachesize;
         else
           info->write_buffer= info->buffer;
@@ -787,7 +787,7 @@ int _my_b_cache_read(IO_CACHE *info, uchar *Buffer, size_t Count)
 }
 int _my_b_flush_io_cache(IO_CACHE *info);
 
-int _internal_concurrent_read_append(IO_CACHE *info, uchar *Buffer, size_t Count)
+int _concurrent_read_append(IO_CACHE *info, uchar *Buffer, size_t Count)
 {
   size_t len_in_buff, copy_len, transfer_len;
   uchar* save_append_read_pos;
@@ -822,50 +822,113 @@ int _internal_concurrent_read_append(IO_CACHE *info, uchar *Buffer, size_t Count
 
 int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count)
 {
-  size_t left_length;
-  if(info->read_pos == info->read_end)
-    return _internal_concurrent_read_append(info, Buffer, Count);
+  size_t left_length = 0, diff_length, length, max_length;
+  my_off_t pos_in_file;
+  int error;
 
-  if (info->read_pos + Count <= info->read_end)
+  lock_append_buffer(info);
+  if ((pos_in_file=info->pos_in_file +
+                   (size_t) (info->read_end - info->buffer)) < info->end_of_file)
   {
-    memcpy(Buffer, info->read_pos, Count);
-    info->read_pos+= Count;
-    return 0;
+    error= mysql_file_seek(info->file, pos_in_file, MY_SEEK_SET, MYF(0)) ==
+           MY_FILEPOS_ERROR;
+
+    if (!error)
+    {
+      info->seek_not_done= 0;
+
+      diff_length= (size_t) (pos_in_file & (IO_SIZE - 1));
+
+      if (Count >= (size_t) (IO_SIZE + (IO_SIZE - diff_length)))
+      {
+        /* Fill first intern buffer */
+        size_t read_length;
+
+        length= IO_ROUND_DN(Count) - diff_length;
+
+        read_length=
+            mysql_file_read(info->file, Buffer, length, info->myflags);
+        if (read_length != (size_t) -1)
+        {
+          Count-= read_length;
+          Buffer+= read_length;
+          pos_in_file+= read_length;
+
+          if (read_length != length)
+          {
+            return _concurrent_read_append(info, Buffer, Count);
+          }
+        }
+        left_length+= length;
+        diff_length= 0;
+      }
+
+      max_length= info->read_length - diff_length;
+      if (max_length > (info->end_of_file - pos_in_file))
+        max_length= (size_t) (info->end_of_file - pos_in_file);
+
+      if (max_length)
+      {
+        length= mysql_file_read(info->file, info->buffer, max_length,
+                                info->myflags);
+        if (length >= Count)
+        {
+          unlock_append_buffer(info);
+          info->read_pos=info->buffer+Count;
+          info->read_end=info->buffer+length;
+          info->pos_in_file=pos_in_file;
+          memcpy(Buffer,info->buffer,(size_t) Count);
+          return 0;
+        }
+        memcpy(Buffer, info->buffer, length);
+        Count-= length;
+        Buffer+= length;
+
+        pos_in_file+= length;
+      }
+      else
+      {
+        if (Count)
+          // goto read_append_buffer;
+          length= 0;
+      }
+    }
   }
 
-  if ((left_length= (size_t) (info->read_end - info->read_pos)))
+
+  if(info->read_pos != info->read_end)
   {
-    DBUG_ASSERT(Count > left_length);
-    memcpy(Buffer, info->read_pos, left_length);
-    Buffer+=left_length;
-    Count-=left_length;
+    if ((left_length= (size_t) (info->read_end - info->read_pos)))
+    {
+      DBUG_ASSERT(Count > left_length);
+      memcpy(Buffer, info->read_pos, left_length);
+      Buffer+=left_length;
+      Count-=left_length;
+    }
   }
-  return _internal_concurrent_read_append(info, Buffer, Count);
+  unlock_append_buffer(info);
+  return _concurrent_read_append(info, Buffer, Count);
 }
 int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count)
 {
   size_t /*rest_length,*/length;
+  int error;
 
   lock_append_buffer(info);
   if(info->write_pos + Count > info->write_end)
   {
-    if (_my_b_flush_io_cache(info))
-    {
-      unlock_append_buffer(info);
-      return 1;
-    }
+    error = _my_b_flush_io_cache(info);
   }
-  if (Count >= IO_SIZE)
+  if (!error && Count >= info->buffer_length)
   {
     length= IO_ROUND_DN(Count);
-    if (mysql_file_write(info->file,Buffer, length, info->myflags | MY_NABP))
+    error = mysql_file_write(info->file,Buffer, length, info->myflags | MY_NABP);
+    if(!error)
     {
-      unlock_append_buffer(info);
-      return info->error= -1;
+      Count-=length;
+      Buffer+=length;
+      info->end_of_file+=length;
     }
-    Count-=length;
-    Buffer+=length;
-    info->end_of_file+=length;
   }
 
 

@@ -505,7 +505,7 @@ static inline int my_b_inited(IO_CACHE *info) { return MY_TEST(info->buffer); }
 
 static inline int my_b_read(IO_CACHE *info, uchar *Buffer, size_t Count)
 {
-  if (info->read_pos + Count <= info->read_end && info->type != CBQ_READ_APPEND)
+  if (info->read_pos + Count <= info->read_end)
   {
     memcpy(Buffer, info->read_pos, Count);
     info->read_pos+= Count;
@@ -517,7 +517,7 @@ static inline int my_b_read(IO_CACHE *info, uchar *Buffer, size_t Count)
 static inline int my_b_write(IO_CACHE *info, const uchar *Buffer, size_t Count)
 {
   MEM_CHECK_DEFINED(Buffer, Count);
-  if (info->write_pos + Count <= info->write_end && info->type != CBQ_READ_APPEND)
+  if (info->write_pos + Count <= info->write_end)
   {
     if (Count)
     {
