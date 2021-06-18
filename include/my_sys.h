@@ -804,6 +804,7 @@ void seek_io_cache(IO_CACHE *cache, my_off_t needed_offset);
 
 extern void remove_io_thread(IO_CACHE *info);
 extern int my_b_append(IO_CACHE *info,const uchar *Buffer,size_t Count);
+extern int my_b_append_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count);
 extern int my_b_safe_write(IO_CACHE *info,const uchar *Buffer,size_t Count);
 
 extern int my_block_write(IO_CACHE *info, const uchar *Buffer,
