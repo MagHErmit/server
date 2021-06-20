@@ -52,7 +52,7 @@ void* read_to_cache()
 void* write_to_cache()
 {
   for (int i= 0; i < 32; ++i)
-    my_b_append(&cache, buff_from + (i*275), 275);
+    my_b_append_concurrent(&cache, buff_from + (i*275), 275);
   return NULL;
 }
 

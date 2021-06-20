@@ -70,7 +70,7 @@ static int _my_b_cache_write(IO_CACHE *info, const uchar *Buffer, size_t Count);
 static int _my_b_cache_write_r(IO_CACHE *info, const uchar *Buffer, size_t Count);
 /* MDEV-24676 */
 static int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count);
-static int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count);
+
 
 int (*_my_b_encr_read)(IO_CACHE *info,uchar *Buffer,size_t Count)= 0;
 int (*_my_b_encr_write)(IO_CACHE *info,const uchar *Buffer,size_t Count)= 0;
@@ -120,7 +120,7 @@ init_functions(IO_CACHE* info)
     break;
   case CBQ_READ_APPEND:
     info->read_function = _my_b_cache_read_concurrent;
-    info->write_function = _my_b_cache_write_concurrent;
+    //info->write_function = _my_b_cache_write_concurrent;
     break;
   case TYPE_NOT_SET:
     DBUG_ASSERT(0);
@@ -279,6 +279,12 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
     mysql_mutex_init(key_IO_CACHE_append_buffer_lock,
                      &info->append_buffer_lock, MY_MUTEX_INIT_FAST);
   }
+
+  if(type == CBQ_READ_APPEND)
+  {
+    mysql_cond_init(key_IO_CACHE_SHARE_cond_writer, &info->cond_writer, 0);
+  }
+
 #if defined(SAFE_MUTEX)
   else
   {
@@ -783,7 +789,6 @@ int _my_b_cache_read(IO_CACHE *info, uchar *Buffer, size_t Count)
     memcpy(Buffer, info->buffer, Count);
   DBUG_RETURN(0);
 }
-int _my_b_flush_io_cache(IO_CACHE *info);
 
 int _concurrent_read_append(IO_CACHE *info, uchar *Buffer, size_t Count)
 {
@@ -813,7 +818,7 @@ int _concurrent_read_append(IO_CACHE *info, uchar *Buffer, size_t Count)
   info->read_pos= info->buffer;
   info->read_end= info->buffer+transfer_len;
   info->append_read_pos=info->write_pos;
-  //info->end_of_file+=len_in_buff;
+  info->end_of_file+=len_in_buff;
   unlock_append_buffer(info);
   return 0;
 }
@@ -854,6 +859,7 @@ int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count)
 
           if (read_length != length)
           {
+            unlock_append_buffer(info);
             return _concurrent_read_append(info, Buffer, Count);
           }
         }
@@ -907,20 +913,25 @@ int _my_b_cache_read_concurrent(IO_CACHE *info, uchar *Buffer, size_t Count)
 
   return _concurrent_read_append(info, Buffer, Count);
 }
-int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count)
+
+int my_b_append_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Count)
 {
   size_t rest_length, length;
+  const uchar* saved_buffer;
+  uchar* saved_write_pos;
 
   lock_append_buffer(info);
+  saved_buffer = Buffer;
   rest_length= (size_t) (info->write_end - info->write_pos);
   if(Count <= rest_length)
     goto end;
 
   Buffer += rest_length;
   Count -= rest_length;
+  saved_write_pos = info->write_pos;
   info->write_pos += rest_length;
   unlock_append_buffer(info);
-  memcpy(info->write_pos, Buffer, rest_length);
+  memcpy(saved_write_pos, saved_buffer, rest_length);
 
   if(my_b_flush_io_cache(info, 1))
     return 1;
@@ -933,15 +944,18 @@ int _my_b_cache_write_concurrent(IO_CACHE *info, const uchar *Buffer, size_t Cou
     {
       return info->error= -1;
     }
+
     Count-=length;
     Buffer+=length;
+    saved_buffer = Buffer;
     info->end_of_file+=length;
   }
 
 end:
+  saved_write_pos = info->write_pos;
   info->write_pos+=Count;
   unlock_append_buffer(info);
-  memcpy(info->write_pos, Buffer, Count);
+  memcpy(saved_write_pos, saved_buffer, Count);
 
   return 0;
 }
@@ -1962,6 +1976,10 @@ int end_io_cache(IO_CACHE *info)
   {
     /* Destroy allocated mutex */
     mysql_mutex_destroy(&info->append_buffer_lock);
+  }
+  if(info->type == CBQ_READ_APPEND)
+  {
+    mysql_cond_destroy(&info->cond_writer);
   }
   info->share= 0;
   info->type= TYPE_NOT_SET;                  /* Ensure that flush_io_cache() does nothing */
