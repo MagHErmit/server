@@ -1,5 +1,6 @@
 #include "my_sys.h"
 #include "pthread.h"
+#include "time.h"
 
 
 IO_CACHE cache;
@@ -57,18 +58,23 @@ void* write_to_cache()
 
 int main() {
   pthread_t thr_read, thr_write;
-
+  clock_t tss, tee;
   int fd;
+
   buff_to = (uchar*)malloc(sizeof(uchar) * 10000);
+  tss = clock();
   fd = my_open("input.txt",O_CREAT | O_RDWR,MYF(MY_WME));
   init_io_cache(&cache, fd, 2, CBQ_READ_APPEND, 0,0, MYF(MY_WME));
+
+
 
   pthread_create(&thr_write, NULL, write_to_cache, NULL);
   pthread_create(&thr_read, NULL, read_to_cache, NULL);
 
   pthread_join(thr_read, NULL);
   pthread_join(thr_write, NULL);
-
   end_io_cache(&cache);
+  tee = clock();
+  printf("Time: %lld\n", (long long) tee - tss);
   my_close(cache.file, MYF(MY_WME));
 }
