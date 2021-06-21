@@ -411,6 +411,7 @@ typedef struct st_io_cache		/* Used when caching files */
   /* The non-inclusive boundary of the valid write area */
   uchar *write_end;
 
+  uchar *write_new_pos;
   /* For a synchronized writer. */
   mysql_cond_t        cond_writer;
 
