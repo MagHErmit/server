@@ -283,6 +283,7 @@ int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
   if(type == CBQ_READ_APPEND)
   {
     mysql_cond_init(key_IO_CACHE_SHARE_cond_writer, &info->cond_writer, 0);
+    mysql_mutex_init(key_IO_CACHE_SHARE_mutex, &info->mutex_writer, MY_MUTEX_INIT_FAST);
   }
 
 #if defined(SAFE_MUTEX)
@@ -1809,6 +1810,8 @@ int my_b_safe_write(IO_CACHE *info, const uchar *Buffer, size_t Count)
   */
   if (info->type == SEQ_READ_APPEND)
     return my_b_append(info, Buffer, Count);
+  if (info->type == CBQ_READ_APPEND)
+    return my_b_append_concurrent(info, Buffer, Count);
   return my_b_write(info, Buffer, Count);
 }
 
@@ -1980,6 +1983,7 @@ int end_io_cache(IO_CACHE *info)
   if(info->type == CBQ_READ_APPEND)
   {
     mysql_cond_destroy(&info->cond_writer);
+    mysql_mutex_destroy(&info->mutex_writer);
   }
   info->share= 0;
   info->type= TYPE_NOT_SET;                  /* Ensure that flush_io_cache() does nothing */
