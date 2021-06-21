@@ -411,6 +411,13 @@ typedef struct st_io_cache		/* Used when caching files */
   /* The non-inclusive boundary of the valid write area */
   uchar *write_end;
 
+  uchar *write_new_pos;
+  /* For a synchronized writer. */
+  mysql_cond_t        cond_writer;
+
+  /* To sync on writers into buffer. */
+  mysql_mutex_t       mutex_writer;
+
   /*
     The lock is for append buffer used in SEQ_READ_APPEND cache
     need mutex copying from append buffer to read buffer.
